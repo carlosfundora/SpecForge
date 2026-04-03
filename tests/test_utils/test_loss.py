@@ -1,8 +1,16 @@
 import unittest
+import warnings
 
 import torch
 
-from specforge.core.loss import LogSoftmaxLoss, _compute_loss
+from specforge.core.loss import (
+    HIP_MAX_FUSED_SIZE,
+    MAX_FUSED_SIZE,
+    LogSoftmaxLoss,
+    _calculate_settings,
+    _compute_loss,
+    compute_log_softmax_loss,
+)
 
 from .utils import norm_tensor
 
@@ -38,6 +46,33 @@ class TestLogSoftmaxLoss(unittest.TestCase):
             for t in T:
                 for v in V:
                     self._test_loss_and_gradient_calculation(b, t, v)
+
+    def test_large_vocab_settings_are_chunked(self):
+        block_size, num_warps = _calculate_settings(151669)
+        max_expected = HIP_MAX_FUSED_SIZE if torch.version.hip is not None else MAX_FUSED_SIZE
+        self.assertLessEqual(block_size, max_expected)
+        self.assertGreater(block_size, 0)
+        self.assertGreater(num_warps, 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires GPU")
+    def test_large_vocab_prefers_triton_path(self):
+        device = "cuda"
+        B, T, V = 1, 1, 151669
+        logits = norm_tensor((B, T, V), device, torch.float32)
+        target = norm_tensor((B, T, V), device, torch.float32)
+        position_mask = torch.ones((B, T, 1), dtype=torch.bool, device=device)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loss = compute_log_softmax_loss(logits, target, position_mask)
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertFalse(
+            any("Falling back to the compiled PyTorch log-softmax loss" in str(w.message) for w in caught)
+        )
+
+        loss.backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
 
     def test_ttt_loss_accumulation(self):
         if not torch.cuda.is_available():

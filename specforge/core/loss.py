@@ -5,10 +5,16 @@ The idea of in-place backward pass is from Liger-Kernel.
 See the original Liger-Kernel repository at https://github.com/linkedin/Liger-Kernel.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
+
+MAX_FUSED_SIZE = 131072
+HIP_MAX_FUSED_SIZE = 32768
+_FALLBACK_WARNED = False
 
 
 # Reference implementation
@@ -24,12 +30,12 @@ def _compute_loss(logits, target_p, position_mask):
 def _calculate_settings(n):
     # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
 
-    MAX_FUSED_SIZE = 131072
-    BLOCK_SIZE = triton.next_power_of_2(n)
-    if BLOCK_SIZE > MAX_FUSED_SIZE:
-        raise RuntimeError(
-            f"Cannot launch Triton kernel since n = {n} exceeds the recommended Triton blocksize = {MAX_FUSED_SIZE}."
-        )
+    max_fused_size = (
+        HIP_MAX_FUSED_SIZE
+        if hasattr(torch.version, "hip") and torch.version.hip is not None
+        else MAX_FUSED_SIZE
+    )
+    BLOCK_SIZE = min(triton.next_power_of_2(min(n, max_fused_size)), max_fused_size)
 
     num_warps = 4
     if BLOCK_SIZE >= 32768:
@@ -44,6 +50,24 @@ def _calculate_settings(n):
         num_warps //= 2
 
     return BLOCK_SIZE, num_warps
+
+
+def compute_log_softmax_loss(logits, target_p, position_mask):
+    global _FALLBACK_WARNED
+    if not logits.is_cuda:
+        return _compute_loss(logits, target_p, position_mask)
+
+    try:
+        return LogSoftmaxLoss.apply(logits, target_p, position_mask)
+    except RuntimeError as exc:
+        if not _FALLBACK_WARNED:
+            warnings.warn(
+                "Falling back to the compiled PyTorch log-softmax loss because "
+                f"the Triton path failed: {exc}",
+                stacklevel=2,
+            )
+            _FALLBACK_WARNED = True
+        return _compute_loss(logits, target_p, position_mask)
 
 
 @triton.jit
