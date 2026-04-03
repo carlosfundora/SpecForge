@@ -1331,8 +1331,21 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.config = config
         self.quant_config = quant_config
 
+        if not hasattr(self.config, "parallel_drafting"):
+            self.config.parallel_drafting = False
+        if not hasattr(self.config, "k_train"):
+            self.config.k_train = 8
+        if not hasattr(self.config, "cod_retention"):
+            self.config.cod_retention = 0.8
+        if not hasattr(self.config, "mask_token_id") or self.config.mask_token_id is None:
+            self.config.mask_token_id = (
+                self.config.pad_token_id if self.config.pad_token_id is not None else 0
+            )
+
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = config.draft_vocab_size
+        self.parallel_drafting = bool(self.config.parallel_drafting)
+        self.mask_token_id = int(self.config.mask_token_id)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -1346,6 +1359,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.fc = torch.nn.Linear(
                 config.hidden_size * 3, config.hidden_size, bias=False
             )
+        self.mask_hidden = nn.Parameter(torch.zeros(1, 1, self.fc.in_features))
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
@@ -1357,6 +1371,13 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+    def freeze_embedding(self) -> None:
+        if self.parallel_drafting:
+            # P-EAGLE learns a dedicated mask token row; keep embeddings trainable.
+            self.embed_tokens.weight.requires_grad = True
+            return
+        super().freeze_embedding()
 
     def forward(
         self,
@@ -1425,6 +1446,63 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)
         return self.lm_head(norm_hidden_states)
+
+    def prepare_p_eagle_inputs(
+        self,
+        last_token_ids: torch.Tensor,
+        fused_hidden_states: torch.Tensor,
+        k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+
+        if last_token_ids.dim() == 1:
+            last_token_ids = last_token_ids.unsqueeze(-1)
+        if last_token_ids.dim() != 2 or last_token_ids.shape[1] != 1:
+            raise ValueError(
+                "last_token_ids must have shape [batch, 1] for P-EAGLE input construction"
+            )
+
+        if fused_hidden_states.dim() != 3 or fused_hidden_states.shape[1] != 1:
+            raise ValueError(
+                "fused_hidden_states must have shape [batch, 1, hidden*3] for P-EAGLE input construction"
+            )
+
+        expected_hidden = self.fc.in_features
+        if fused_hidden_states.shape[-1] != expected_hidden:
+            raise ValueError(
+                f"Expected fused hidden size {expected_hidden}, got {fused_hidden_states.shape[-1]}"
+            )
+
+        batch = last_token_ids.shape[0]
+        device = last_token_ids.device
+        hidden_dtype = fused_hidden_states.dtype
+
+        if k == 1:
+            all_hidden_states = fused_hidden_states
+            input_ids = last_token_ids
+        else:
+            mask_hidden = self.mask_hidden.to(device=device, dtype=hidden_dtype).expand(
+                batch, k - 1, -1
+            )
+            all_hidden_states = torch.cat([fused_hidden_states, mask_hidden], dim=1)
+            mask_token_ids = torch.full(
+                (batch, k - 1),
+                self.mask_token_id,
+                dtype=last_token_ids.dtype,
+                device=device,
+            )
+            input_ids = torch.cat([last_token_ids, mask_token_ids], dim=1)
+
+        input_embeds = self.embed_input_ids(input_ids)
+        projected_hidden_states = self.project_hidden_states(all_hidden_states)
+        attention_mask = torch.ones(
+            (batch, k), dtype=torch.bool, device=projected_hidden_states.device
+        )
+        position_ids = torch.arange(k, device=device, dtype=torch.long).unsqueeze(0)
+        position_ids = position_ids.expand(batch, -1)
+
+        return projected_hidden_states, input_embeds, attention_mask, position_ids
 
     def backbone(
         self,

@@ -114,6 +114,29 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         self.embed_tokens.weight.requires_grad = False
 
+    def supports_parallel_drafting(self) -> bool:
+        """
+        Whether this draft model advertises P-EAGLE style parallel drafting support.
+        """
+        return bool(getattr(self.config, "parallel_drafting", False))
+
+    @abstractmethod
+    def prepare_p_eagle_inputs(
+        self,
+        last_token_ids: torch.Tensor,
+        fused_hidden_states: torch.Tensor,
+        k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Build the parallel drafting inputs for a single P-EAGLE forward pass.
+
+        Returns:
+            projected_hidden_states: [batch, k, hidden]
+            input_embeds: [batch, k, hidden]
+            attention_mask: [batch, k]
+            position_ids: [batch, k]
+        """
+
     @torch.no_grad()
     def load_embedding(
         self, model_path: str, embedding_key: str = "model.embed_tokens.weight"

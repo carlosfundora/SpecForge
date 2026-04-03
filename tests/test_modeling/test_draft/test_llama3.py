@@ -44,6 +44,10 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             "use_cache": True,
             "vocab_size": 128256,
             "draft_vocab_size": 32000,
+            "parallel_drafting": False,
+            "k_train": 8,
+            "cod_retention": 0.8,
+            "mask_token_id": 0,
         }
 
         self.config = LlamaConfig(**config_dict)
@@ -126,6 +130,89 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
 
         with self.assertRaises(AttributeError):
             LlamaForCausalLMEagle3(invalid_config)
+
+    def test_prepare_p_eagle_inputs(self):
+        parallel_config = LlamaConfig(
+            **{
+                **self.config.to_dict(),
+                "parallel_drafting": True,
+                "mask_token_id": 17,
+            }
+        )
+        model = LlamaForCausalLMEagle3(parallel_config)
+        model.mask_hidden.data.fill_(0.25)
+
+        last_token_ids = torch.tensor([[5], [9]], dtype=torch.long)
+        fused_hidden_states = torch.randn(2, 1, model.fc.in_features)
+        hidden_states, input_embeds, attention_mask, position_ids = (
+            model.prepare_p_eagle_inputs(
+                last_token_ids=last_token_ids,
+                fused_hidden_states=fused_hidden_states,
+                k=4,
+            )
+        )
+
+        expected_hidden_inputs = torch.cat(
+            [
+                fused_hidden_states,
+                model.mask_hidden.expand(2, 3, -1).to(fused_hidden_states.dtype),
+            ],
+            dim=1,
+        )
+        expected_input_ids = torch.tensor(
+            [[5, 17, 17, 17], [9, 17, 17, 17]], dtype=torch.long
+        )
+
+        self.assertEqual(hidden_states.shape, (2, 4, parallel_config.hidden_size))
+        self.assertEqual(input_embeds.shape, (2, 4, parallel_config.hidden_size))
+        self.assertTrue(torch.equal(attention_mask, torch.ones(2, 4, dtype=torch.bool)))
+        self.assertTrue(
+            torch.equal(position_ids, torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]))
+        )
+        self.assertTrue(
+            torch.allclose(
+                hidden_states,
+                model.project_hidden_states(expected_hidden_inputs),
+                atol=1e-5,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                input_embeds,
+                model.embed_input_ids(expected_input_ids),
+                atol=1e-5,
+            )
+        )
+
+    def test_parallel_drafting_round_trip(self):
+        config_dict = {
+            **self.config.to_dict(),
+            "architectures": ["LlamaForCausalLMEagle3"],
+            "parallel_drafting": True,
+            "mask_token_id": 23,
+            "k_train": 6,
+            "cod_retention": 0.7,
+        }
+        config_path = os.path.join(self.temp_dir, "config.json")
+        with open(config_path, "w") as f:
+            import json
+
+            json.dump(config_dict, f)
+
+        loaded_config = LlamaConfig.from_pretrained(self.temp_dir)
+        self.assertTrue(loaded_config.parallel_drafting)
+        self.assertEqual(loaded_config.mask_token_id, 23)
+        self.assertEqual(loaded_config.k_train, 6)
+        self.assertAlmostEqual(loaded_config.cod_retention, 0.7)
+
+        model = LlamaForCausalLMEagle3(loaded_config)
+        model.mask_hidden.data.fill_(1.5)
+        model.save_pretrained(self.temp_dir)
+        reloaded = LlamaForCausalLMEagle3.from_pretrained(self.temp_dir)
+
+        self.assertTrue(reloaded.parallel_drafting)
+        self.assertEqual(reloaded.mask_token_id, 23)
+        self.assertTrue(torch.allclose(reloaded.mask_hidden, model.mask_hidden))
 
 
 if __name__ == "__main__":

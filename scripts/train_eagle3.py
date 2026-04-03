@@ -96,6 +96,24 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         choices=["sglang", "hf", "custom"],
         help="The backend of the target model",
     )
+    model_group.add_argument(
+        "--speculative-algorithm",
+        type=str,
+        default="EAGLE3",
+        choices=["EAGLE3", "P_EAGLE"],
+        help="Draft-model training mode. P_EAGLE enables parallel drafting metadata on top of the EAGLE3 head.",
+    )
+    model_group.add_argument(
+        "--parallel-drafting",
+        action="store_true",
+        help="Enable P-EAGLE style parallel drafting metadata and mask-token state in the draft config.",
+    )
+    model_group.add_argument(
+        "--mask-token-id",
+        type=int,
+        default=None,
+        help="Token id used for masked parallel draft slots. Defaults to pad_token_id or 0.",
+    )
 
     # dataset arguments
     dataset_group = parser.add_argument_group("dataset")
@@ -165,6 +183,18 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--k-train",
+        type=int,
+        default=8,
+        help="Parallel draft depth used for P-EAGLE training metadata.",
+    )
+    training_group.add_argument(
+        "--cod-retention",
+        type=float,
+        default=0.8,
+        help="Conditional Drop-token retention ratio for P-EAGLE training metadata.",
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -380,6 +410,21 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     else:
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+
+    draft_model_config.speculative_algorithm = args.speculative_algorithm
+    draft_model_config.parallel_drafting = bool(
+        args.parallel_drafting or args.speculative_algorithm == "P_EAGLE"
+    )
+    draft_model_config.k_train = args.k_train
+    draft_model_config.cod_retention = args.cod_retention
+    if args.mask_token_id is not None:
+        draft_model_config.mask_token_id = args.mask_token_id
+    elif getattr(draft_model_config, "mask_token_id", None) is None:
+        draft_model_config.mask_token_id = (
+            draft_model_config.pad_token_id
+            if draft_model_config.pad_token_id is not None
+            else 0
+        )
 
     # Handle base ckpt, config file
     draft_model_last_checkpoint = None
