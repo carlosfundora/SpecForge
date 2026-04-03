@@ -168,6 +168,7 @@ class OnlineEagle3Model(Eagle3Model):
         past_key_values_length = 0
 
         # Step 2: project the concatenated hidden states to the target hidden size
+        fused_hidden_states = hidden_states
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
@@ -199,6 +200,65 @@ class OnlineEagle3Model(Eagle3Model):
                 seq_length=seq_length,
                 past_key_values_length=past_key_values_length,
             )
+
+        if self.draft_model.supports_parallel_drafting():
+            if self.attention_backend != "sdpa":
+                raise NotImplementedError(
+                    "P-EAGLE training currently supports the sdpa attention backend only."
+                )
+
+            flat_last_token_ids = input_ids.reshape(batch_size * seq_length, 1)
+            flat_fused_hidden_states = fused_hidden_states.reshape(
+                batch_size * seq_length, 1, fused_hidden_states.shape[-1]
+            )
+            (
+                parallel_hidden_states,
+                parallel_input_embeds,
+                parallel_attention_mask,
+                parallel_position_ids,
+            ) = self.draft_model.prepare_p_eagle_inputs(
+                flat_last_token_ids,
+                flat_fused_hidden_states,
+                self.length,
+            )
+            parallel_attention_mask = self.draft_model.prepare_decoder_attention_mask(
+                attention_mask=parallel_attention_mask,
+                hidden_states=parallel_hidden_states,
+                batch_size=parallel_hidden_states.shape[0],
+                seq_length=self.length,
+                past_key_values_length=0,
+            )
+            parallel_input_embeds = parallel_input_embeds.to(parallel_hidden_states.dtype)
+            parallel_hidden_states = self.draft_model.backbone(
+                input_embeds=parallel_input_embeds,
+                hidden_states=parallel_hidden_states,
+                cache_hidden=None,
+                attention_mask=parallel_attention_mask,
+                position_ids=parallel_position_ids,
+                past_key_values=None,
+                use_cache=False,
+            )
+            logits = self.draft_model.compute_logits(parallel_hidden_states).view(
+                batch_size, seq_length, self.length, -1
+            )
+
+            plosses = []
+            acces = []
+            adapter = self._make_adapter()
+            for idx in range(self.length):
+                step_logits = logits[:, :, idx, :].contiguous()
+                step_target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
+                acc, loss = self._acc_and_loss(
+                    logits=step_logits,
+                    target_p=step_target_p,
+                    position_mask=position_mask,
+                    loss_mask=loss_mask,
+                    adapter=adapter,
+                )
+                acces.append(acc)
+                plosses.append(loss)
+
+            return plosses, [], acces
 
         # Step 5: run TTT
         plosses = []
@@ -596,6 +656,10 @@ def _compute_target_p(target, t2d, loss_mask):
     target_dtype = target_head.dtype if target_head.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
     target_head = target_head.float()
     target_p = nn.Softmax(dim=2)(target_head).to(target_dtype)
+    target_p = torch.nan_to_num(target_p, nan=0.0, posinf=0.0, neginf=0.0)
+    target_p = torch.where(position_mask, target_p, torch.zeros_like(target_p))
+    target_p_sum = target_p.sum(dim=2, keepdim=True)
+    target_p = torch.where(target_p_sum > 0, target_p / target_p_sum.clamp_min(1e-12), target_p)
     target_p = target_p.detach()
     return target_p, position_mask
 

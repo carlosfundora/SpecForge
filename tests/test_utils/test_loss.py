@@ -1,5 +1,6 @@
 import unittest
 import warnings
+from unittest.mock import patch
 
 import torch
 
@@ -73,6 +74,20 @@ class TestLogSoftmaxLoss(unittest.TestCase):
 
         loss.backward()
         self.assertTrue(torch.isfinite(logits.grad).all())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires GPU")
+    def test_non_finite_triton_loss_falls_back(self):
+        logits = norm_tensor((1, 1, 16), "cuda", torch.float32)
+        target = norm_tensor((1, 1, 16), "cuda", torch.float32)
+        position_mask = torch.ones((1, 1, 1), dtype=torch.bool, device="cuda")
+
+        finite_loss = _compute_loss(logits, target, position_mask)
+        with patch("specforge.core.loss.LogSoftmaxLoss.apply", return_value=torch.tensor(float("nan"))):
+            with patch("specforge.core.loss._compute_loss", return_value=finite_loss) as fallback:
+                recovered = compute_log_softmax_loss(logits, target, position_mask)
+
+        self.assertTrue(torch.isfinite(recovered))
+        fallback.assert_called_once()
 
     def test_ttt_loss_accumulation(self):
         if not torch.cuda.is_available():

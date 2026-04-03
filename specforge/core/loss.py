@@ -58,7 +58,10 @@ def compute_log_softmax_loss(logits, target_p, position_mask):
         return _compute_loss(logits, target_p, position_mask)
 
     try:
-        return LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        if torch.isfinite(loss).all():
+            return loss
+        raise RuntimeError("the Triton path returned a non-finite loss")
     except RuntimeError as exc:
         if not _FALLBACK_WARNED:
             warnings.warn(
@@ -67,7 +70,19 @@ def compute_log_softmax_loss(logits, target_p, position_mask):
                 stacklevel=2,
             )
             _FALLBACK_WARNED = True
-        return _compute_loss(logits, target_p, position_mask)
+        fallback_loss = _compute_loss(logits, target_p, position_mask)
+        if torch.isfinite(fallback_loss).all():
+            return fallback_loss
+        logits_finite = torch.isfinite(logits)
+        target_finite = torch.isfinite(target_p)
+        active_positions = int(position_mask.sum().item())
+        raise RuntimeError(
+            "Both the Triton and compiled PyTorch log-softmax losses returned "
+            f"non-finite values. Original Triton error: {exc}. "
+            f"logits_finite={int(logits_finite.sum().item())}/{logits.numel()}, "
+            f"target_finite={int(target_finite.sum().item())}/{target_p.numel()}, "
+            f"active_positions={active_positions}"
+        ) from exc
 
 
 @triton.jit

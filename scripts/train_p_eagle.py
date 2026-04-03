@@ -11,8 +11,9 @@ DEFAULT_CACHE_DIR = ROOT_DIR / "cache"
 DEFAULT_DATASET_DIR = DEFAULT_CACHE_DIR / "dataset"
 DEFAULT_COMPILED_KERNEL_DIR = DEFAULT_CACHE_DIR / "compiled_kernels"
 DEFAULT_MODEL_REGISTRY = Path("/home/local/Projects/models/registry")
-THOTH_ROOT = ROOT_DIR.parent
-SGLANG_PYTHON_DIR = THOTH_ROOT / "sglang" / "python"
+FORKS_ROOT = ROOT_DIR.parent
+THOTH_ROOT = FORKS_ROOT.parent
+SGLANG_PYTHON_DIR = FORKS_ROOT / "sglang" / "python"
 DEFAULT_THOTH_ARTIFACT_ROOT = THOTH_ROOT / "artifacts" / "models" / "local"
 
 
@@ -258,7 +259,9 @@ def main():
     env["PYTHONPATH"] = ":".join(pythonpath_entries)
 
     train_cmd = [
-        "torchrun",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         "--standalone",
         "--nproc_per_node",
         str(args.num_gpus),
