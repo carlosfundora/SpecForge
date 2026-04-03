@@ -3,7 +3,6 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-
 try:
     from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 except ImportError:
