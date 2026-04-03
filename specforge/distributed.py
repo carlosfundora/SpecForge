@@ -3,7 +3,12 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+
+try:
+    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+except ImportError:
+    PROCESS_GROUP = None
+    set_seq_parallel_pg = None
 
 from specforge.utils import print_with_rank
 
@@ -72,6 +77,11 @@ def init_distributed(
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
+    if set_seq_parallel_pg is None or PROCESS_GROUP is None:
+        raise ImportError(
+            "SpecForge distributed USP support requires yunchang. Install yunchang "
+            "before calling init_distributed()."
+        )
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
     local_rank = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
