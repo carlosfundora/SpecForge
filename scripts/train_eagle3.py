@@ -184,6 +184,11 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
     training_group.add_argument(
+        "--train-mask-hidden-only",
+        action="store_true",
+        help="Low-VRAM smoke mode: freeze the draft head and train only the P-EAGLE mask_hidden parameter.",
+    )
+    training_group.add_argument(
         "--k-train",
         type=int,
         default=8,
@@ -400,6 +405,21 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     # ckpt info(epoch, step)
     ckpt_info = (0, 0)
 
+    def apply_p_eagle_overrides(config):
+        config.speculative_algorithm = args.speculative_algorithm
+        config.parallel_drafting = bool(
+            args.parallel_drafting or args.speculative_algorithm == "P_EAGLE"
+        )
+        config.k_train = args.k_train
+        config.cod_retention = args.cod_retention
+        if args.mask_token_id is not None:
+            config.mask_token_id = args.mask_token_id
+        elif getattr(config, "mask_token_id", None) is None:
+            config.mask_token_id = (
+                config.pad_token_id if config.pad_token_id is not None else 0
+            )
+        return config
+
     # Handle draft model config
     if args.draft_model_config is None:
         # Auto-generate and save config file
@@ -410,21 +430,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     else:
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-
-    draft_model_config.speculative_algorithm = args.speculative_algorithm
-    draft_model_config.parallel_drafting = bool(
-        args.parallel_drafting or args.speculative_algorithm == "P_EAGLE"
-    )
-    draft_model_config.k_train = args.k_train
-    draft_model_config.cod_retention = args.cod_retention
-    if args.mask_token_id is not None:
-        draft_model_config.mask_token_id = args.mask_token_id
-    elif getattr(draft_model_config, "mask_token_id", None) is None:
-        draft_model_config.mask_token_id = (
-            draft_model_config.pad_token_id
-            if draft_model_config.pad_token_id is not None
-            else 0
-        )
+    draft_model_config = apply_p_eagle_overrides(draft_model_config)
 
     # Handle base ckpt, config file
     draft_model_last_checkpoint = None
@@ -434,6 +440,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             draft_model_config = AutoDraftModelConfig.from_file(
                 os.path.join(args.ckpt_dir, "config.json")
             )
+            draft_model_config = apply_p_eagle_overrides(draft_model_config)
             draft_model_last_checkpoint = args.ckpt_dir
             print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
         else:
@@ -454,6 +461,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
+        draft_model.config = apply_p_eagle_overrides(draft_model.config)
+        draft_model.parallel_drafting = bool(draft_model.config.parallel_drafting)
+        draft_model.mask_token_id = int(draft_model.config.mask_token_id)
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
@@ -476,8 +486,25 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
                 f"epoch={resume_state['epoch']}, step={resume_state['global_step']}"
             )
 
-    draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
+    if draft_model_last_checkpoint:
+        print_on_rank0(
+            "Skipping target embedding reload because the draft model was loaded "
+            "from an existing checkpoint."
+        )
+    else:
+        draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+    if args.train_mask_hidden_only:
+        for param in draft_model.parameters():
+            param.requires_grad = False
+        if not hasattr(draft_model, "mask_hidden"):
+            raise ValueError(
+                "--train-mask-hidden-only requires a draft model with a mask_hidden parameter."
+            )
+        draft_model.mask_hidden.requires_grad = True
+        print_on_rank0(
+            "Low-VRAM smoke mode enabled: training only draft_model.mask_hidden."
+        )
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 
@@ -490,15 +517,19 @@ def build_dataloaders(
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
+    target_vocab_size = len(tokenizer)
 
     # convert to dataloader
-    cache_params_string = (
+    dataset_cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}"  # Tokenizer may also different
+        f"{args.target_model_path}"
     )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    cache_key = hashlib.md5(dataset_cache_params_string.encode()).hexdigest()
+    vocab_mapping_cache_key = hashlib.md5(
+        f"{cache_key}-{target_vocab_size}-{draft_model_config.draft_vocab_size}".encode()
+    ).hexdigest()
     train_dataset = Dataset.from_generator(
         generator=safe_conversations_generator,
         gen_kwargs={"file_path": args.train_data_path},
@@ -522,10 +553,10 @@ def build_dataloaders(
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
+            target_vocab_size=target_vocab_size,
             draft_vocab_size=draft_model_config.draft_vocab_size,
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
+            cache_key=vocab_mapping_cache_key,
         )
 
         if not is_online:
@@ -838,7 +869,6 @@ def main():
     else:
         if is_online:
             eagle3_model = OnlineEagle3Model(
-                target_model=target_model,
                 draft_model=draft_model,
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,

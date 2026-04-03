@@ -196,6 +196,7 @@ outputs/
 wandb/
 .idea
 .vscode/
+configs/*-eagle3-auto.json
 
 # macOS
 .DS_Store

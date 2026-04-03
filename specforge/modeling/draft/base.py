@@ -120,6 +120,14 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         return bool(getattr(self.config, "parallel_drafting", False))
 
+    @property
+    def all_tied_weights_keys(self) -> dict[str, str]:
+        """
+        Transformers 5.x expects this mapping during `from_pretrained()` finalization.
+        Our draft models do not maintain a cached copy, so compute it on demand.
+        """
+        return self.get_expanded_tied_weights_keys(all_submodels=True)
+
     @abstractmethod
     def prepare_p_eagle_inputs(
         self,

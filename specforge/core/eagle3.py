@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import compute_log_softmax_loss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -92,7 +92,7 @@ class OnlineEagle3Model(Eagle3Model):
             )
             acc = local_correct / local_denom
 
-        loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        loss = compute_log_softmax_loss(logits, target_p, position_mask)
         loss = adapter.reduce_loss(loss)
         return acc, loss
 
@@ -553,7 +553,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            loss = compute_log_softmax_loss(logits, target_p, position_mask)
             plosses.append(loss)
 
             if not is_last:
@@ -590,11 +590,12 @@ def _compute_target_p(target, t2d, loss_mask):
     target_head = target
     target_max_token = target_head.argmax(-1)
     target_mask = t2d[target_max_token]
-    target_mask = target_mask[..., None].int()
-    position_mask = target_mask * loss_mask
+    target_mask = target_mask[..., None]
+    position_mask = target_mask & loss_mask.bool()
     target_head = target_head[..., t2d]
+    target_dtype = target_head.dtype if target_head.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
     target_head = target_head.float()
-    target_p = nn.Softmax(dim=2)(target_head)
+    target_p = nn.Softmax(dim=2)(target_head).to(target_dtype)
     target_p = target_p.detach()
     return target_p, position_mask
 

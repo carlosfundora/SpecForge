@@ -76,11 +76,6 @@ def init_distributed(
         timeout(int): Timeout for collective communication in minutes
         tp_size(int): The degree of tensor parallelism
     """
-    if set_seq_parallel_pg is None or PROCESS_GROUP is None:
-        raise ImportError(
-            "SpecForge distributed USP support requires yunchang. Install yunchang "
-            "before calling init_distributed()."
-        )
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
     local_rank = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
@@ -96,24 +91,41 @@ def init_distributed(
         "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
 
-    assert (
-        world_size % (sp_ulysses_size * sp_ring_size) == 0
-    ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
+    use_usp = (sp_ulysses_size * sp_ring_size) > 1
+    if use_usp:
+        if set_seq_parallel_pg is None or PROCESS_GROUP is None:
+            raise ImportError(
+                "SpecForge distributed USP support requires yunchang when "
+                "sp_ulysses_size * sp_ring_size > 1."
+            )
+        assert (
+            world_size % (sp_ulysses_size * sp_ring_size) == 0
+        ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
 
-    draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
-    draft_device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda",
-        (draft_dp_size, sp_ulysses_size * sp_ring_size),
-        mesh_dim_names=("draft_dp", "sp"),
-    )
-    set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
+        draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
+        draft_device_mesh = dist.device_mesh.init_device_mesh(
+            "cuda",
+            (draft_dp_size, sp_ulysses_size * sp_ring_size),
+            mesh_dim_names=("draft_dp", "sp"),
+        )
+        set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
+    else:
+        draft_device_mesh = None
 
     print_with_rank(f"device mesh: {device_mesh}")
     tp_group = device_mesh.get_group("tp")
     dp_group = device_mesh.get_group("dp")
 
-    sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
-    sp_ring_group = PROCESS_GROUP.RING_PG
+    if use_usp:
+        sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
+        sp_ring_group = PROCESS_GROUP.RING_PG
+        draft_dp_group = draft_device_mesh.get_group("draft_dp")
+        draft_sp_group = draft_device_mesh.get_group("sp")
+    else:
+        sp_ulysses_group = dist.group.WORLD
+        sp_ring_group = dist.group.WORLD
+        draft_dp_group = dist.group.WORLD
+        draft_sp_group = dist.group.WORLD
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
 
@@ -124,19 +136,33 @@ def init_distributed(
     _SP_ULYSSES_GROUP = sp_ulysses_group
     _SP_RING_GROUP = sp_ring_group
     _DP_GROUP = dp_group
-    _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
-    _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
+    _DRAFT_DP_GROUP = draft_dp_group
+    _DRAFT_SP_GROUP = draft_sp_group
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
+    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    if not dist.is_initialized():
+        return
+
+    seen_groups = set()
+    for group in (
+        _TP_GROUP,
+        _DP_GROUP,
+        _SP_ULYSSES_GROUP,
+        _SP_RING_GROUP,
+        _DRAFT_DP_GROUP,
+        _DRAFT_SP_GROUP,
+    ):
+        if group is None or group == dist.group.WORLD:
+            continue
+        group_id = id(group)
+        if group_id in seen_groups:
+            continue
+        seen_groups.add(group_id)
+        dist.destroy_process_group(group)
+
     dist.destroy_process_group()
 
 

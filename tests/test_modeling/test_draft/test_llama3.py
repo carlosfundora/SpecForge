@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from huggingface_hub.errors import StrictDataclassClassValidationError
 from transformers import LlamaConfig
 
 from specforge.modeling.draft.llama3_eagle import (
@@ -121,15 +122,13 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             self.assertTrue(torch.equal(param1, param2))
 
     def test_config_validation(self):
-        invalid_config = LlamaConfig(
-            vocab_size=1000,
-            hidden_size=127,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-        )
-
-        with self.assertRaises(AttributeError):
-            LlamaForCausalLMEagle3(invalid_config)
+        with self.assertRaises(StrictDataclassClassValidationError):
+            LlamaConfig(
+                vocab_size=1000,
+                hidden_size=127,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+            )
 
     def test_prepare_p_eagle_inputs(self):
         parallel_config = LlamaConfig(
