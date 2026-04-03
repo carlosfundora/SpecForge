@@ -10,7 +10,10 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
-from yunchang.comm import SeqAllToAll4D
+try:
+    from yunchang.comm import SeqAllToAll4D
+except ImportError:
+    SeqAllToAll4D = None
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -20,7 +23,10 @@ from specforge.modeling.draft.flex_attention import (
 from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
-from ...layers.ring import ring_flash_attn_func
+try:
+    from ...layers.ring import ring_flash_attn_func
+except ImportError:
+    ring_flash_attn_func = None
 from .base import Eagle3DraftModel
 
 try:
@@ -981,6 +987,12 @@ class LlamaUSPFlashAttention(LlamaAttention):
 
     def __init__(self, config):
         super().__init__(config)
+        if SeqAllToAll4D is None or ring_flash_attn_func is None:
+            raise ImportError(
+                "LlamaUSPFlashAttention requires yunchang-backed ring attention. "
+                "Install yunchang or use flex_attention/flash_attention for draft "
+                "model construction."
+            )
         assert (
             dist.is_initialized()
         ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
