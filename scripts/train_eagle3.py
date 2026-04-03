@@ -15,7 +15,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from datasets import Dataset
 from specforge import (
@@ -405,6 +405,31 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     # ckpt info(epoch, step)
     ckpt_info = (0, 0)
 
+    def apply_target_model_compat(config):
+        target_config = AutoConfig.from_pretrained(
+            args.target_model_path, cache_dir=args.model_download_dir
+        )
+        for field in (
+            "rope_scaling",
+            "rope_theta",
+            "max_position_embeddings",
+            "head_dim",
+            "attention_bias",
+            "rms_norm_eps",
+            "hidden_act",
+            "bos_token_id",
+            "eos_token_id",
+            "pad_token_id",
+        ):
+            if hasattr(target_config, field):
+                setattr(config, field, getattr(target_config, field))
+        setattr(
+            config,
+            "use_qk_norm",
+            getattr(target_config, "model_type", None) in {"qwen3", "qwen3_moe"},
+        )
+        return config
+
     def apply_p_eagle_overrides(config):
         config.speculative_algorithm = args.speculative_algorithm
         config.parallel_drafting = bool(
@@ -430,6 +455,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     else:
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
+    draft_model_config = apply_target_model_compat(draft_model_config)
     draft_model_config = apply_p_eagle_overrides(draft_model_config)
 
     # Handle base ckpt, config file
@@ -440,6 +466,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             draft_model_config = AutoDraftModelConfig.from_file(
                 os.path.join(args.ckpt_dir, "config.json")
             )
+            draft_model_config = apply_target_model_compat(draft_model_config)
             draft_model_config = apply_p_eagle_overrides(draft_model_config)
             draft_model_last_checkpoint = args.ckpt_dir
             print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
@@ -458,6 +485,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     if draft_model_last_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
             draft_model_last_checkpoint,
+            config=draft_model_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
@@ -637,34 +665,38 @@ def save_checkpoints(
         os.makedirs(epoch_output_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+    if isinstance(eagle3_model, FSDP):
+        with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
+            model_state_dict = eagle3_model.state_dict()
+    else:
         model_state_dict = eagle3_model.state_dict()
-        state_to_save = {
-            "epoch": epoch,
-            "global_step": step,
-            "args": args,
-        }
-        state_to_save.update(optimizer.state_dict())
-        draft_model_state_dict = {
-            k.replace("draft_model.", ""): v
-            for k, v in model_state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
-        }
 
-        if dist.get_rank() == 0:
-            torch.save(
-                state_to_save,
-                os.path.join(epoch_output_dir, "training_state.pt"),
-            )
-            print_on_rank0(
-                f"Saved full training state to {epoch_output_dir}/training_state.pt"
-            )
-            eagle3_model.draft_model.save_pretrained(
-                epoch_output_dir,
-                state_dict=draft_model_state_dict,
-            )
-            print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-        dist.barrier()
+    state_to_save = {
+        "epoch": epoch,
+        "global_step": step,
+        "args": args,
+    }
+    state_to_save.update(optimizer.state_dict())
+    draft_model_state_dict = {
+        k.replace("draft_model.", ""): v
+        for k, v in model_state_dict.items()
+        if "draft_model." in k and "embed" not in k.lower()
+    }
+
+    if dist.get_rank() == 0:
+        torch.save(
+            state_to_save,
+            os.path.join(epoch_output_dir, "training_state.pt"),
+        )
+        print_on_rank0(
+            f"Saved full training state to {epoch_output_dir}/training_state.pt"
+        )
+        eagle3_model.draft_model.save_pretrained(
+            epoch_output_dir,
+            state_dict=draft_model_state_dict,
+        )
+        print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+    dist.barrier()
 
 
 def run_forward(
@@ -880,17 +912,23 @@ def main():
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
             )
-    eagle3_model = FSDP(
-        eagle3_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        process_group=dist.group.WORLD,  # the draft model should run dp for all processes
-    )
-    print_with_rank("Initialized Eagle3 FSDP model")
+    if dist.get_world_size() == 1:
+        eagle3_model = eagle3_model.cuda()
+        print_with_rank(
+            "Initialized Eagle3 model without FSDP because world_size=1."
+        )
+    else:
+        eagle3_model = FSDP(
+            eagle3_model,
+            use_orig_params=True,
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            ),
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            process_group=dist.group.WORLD,  # the draft model should run dp for all processes
+        )
+        print_with_rank("Initialized Eagle3 FSDP model")
 
     # ================================================
     # 5. Build optimizer and scheduler

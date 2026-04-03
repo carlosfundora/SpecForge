@@ -8,6 +8,7 @@ import torch
 from huggingface_hub.errors import StrictDataclassClassValidationError
 from transformers import LlamaConfig
 
+from specforge.modeling.auto import AutoEagle3DraftModel
 from specforge.modeling.draft.llama3_eagle import (
     LlamaAttention,
     LlamaForCausalLMEagle3,
@@ -142,12 +143,14 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         model.mask_hidden.data.fill_(0.25)
 
         last_token_ids = torch.tensor([[5], [9]], dtype=torch.long)
+        base_position_ids = torch.tensor([[11], [23]], dtype=torch.long)
         fused_hidden_states = torch.randn(2, 1, model.fc.in_features)
         hidden_states, input_embeds, attention_mask, position_ids = (
             model.prepare_p_eagle_inputs(
                 last_token_ids=last_token_ids,
                 fused_hidden_states=fused_hidden_states,
                 k=4,
+                base_position_ids=base_position_ids,
             )
         )
 
@@ -166,7 +169,7 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         self.assertEqual(input_embeds.shape, (2, 4, parallel_config.hidden_size))
         self.assertTrue(torch.equal(attention_mask, torch.ones(2, 4, dtype=torch.bool)))
         self.assertTrue(
-            torch.equal(position_ids, torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]))
+            torch.equal(position_ids, torch.tensor([[11, 12, 13, 14], [23, 24, 25, 26]]))
         )
         self.assertTrue(
             torch.allclose(
@@ -212,6 +215,121 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         self.assertTrue(reloaded.parallel_drafting)
         self.assertEqual(reloaded.mask_token_id, 23)
         self.assertTrue(torch.allclose(reloaded.mask_hidden, model.mask_hidden))
+
+    def test_parallel_backbone_forward_is_finite(self):
+        parallel_config = LlamaConfig(
+            **{
+                **self.config.to_dict(),
+                "parallel_drafting": True,
+                "mask_token_id": 17,
+            }
+        )
+        model = LlamaForCausalLMEagle3(parallel_config)
+        model = model.to(dtype=torch.bfloat16)
+        last_token_ids = torch.tensor([[5], [9]], dtype=torch.long)
+        fused_hidden_states = torch.randn(
+            2, 1, model.fc.in_features, dtype=torch.bfloat16
+        )
+        hidden_states, input_embeds, attention_mask, position_ids = (
+            model.prepare_p_eagle_inputs(
+                last_token_ids=last_token_ids,
+                fused_hidden_states=fused_hidden_states,
+                k=4,
+                base_position_ids=torch.tensor([[7], [19]], dtype=torch.long),
+            )
+        )
+        attention_mask = model.prepare_decoder_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            batch_size=hidden_states.shape[0],
+            seq_length=4,
+            past_key_values_length=0,
+        )
+        hidden_states = model.backbone(
+            input_embeds=input_embeds.to(hidden_states.dtype),
+            hidden_states=hidden_states,
+            cache_hidden=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=False,
+        )
+        logits = model.compute_logits(hidden_states)
+        self.assertTrue(torch.isfinite(hidden_states).all())
+        self.assertTrue(torch.isfinite(logits).all())
+
+    def test_parallel_backbone_forward_is_finite_with_yarn_rope_theta(self):
+        parallel_config = LlamaConfig(
+            **{
+                **self.config.to_dict(),
+                "parallel_drafting": True,
+                "mask_token_id": 17,
+                "max_position_embeddings": 32768,
+                "use_qk_norm": True,
+                "rope_scaling": {
+                    "rope_type": "yarn",
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 8192,
+                    "rope_theta": 1000000.0,
+                },
+            }
+        )
+        model = LlamaForCausalLMEagle3(parallel_config)
+        model = model.to(dtype=torch.bfloat16)
+        last_token_ids = torch.tensor([[5], [9]], dtype=torch.long)
+        fused_hidden_states = torch.randn(
+            2, 1, model.fc.in_features, dtype=torch.bfloat16
+        )
+        hidden_states, input_embeds, attention_mask, position_ids = (
+            model.prepare_p_eagle_inputs(
+                last_token_ids=last_token_ids,
+                fused_hidden_states=fused_hidden_states,
+                k=4,
+                base_position_ids=torch.tensor([[1024], [2048]], dtype=torch.long),
+            )
+        )
+        attention_mask = model.prepare_decoder_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            batch_size=hidden_states.shape[0],
+            seq_length=4,
+            past_key_values_length=0,
+        )
+        hidden_states = model.backbone(
+            input_embeds=input_embeds.to(hidden_states.dtype),
+            hidden_states=hidden_states,
+            cache_hidden=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=False,
+        )
+        logits = model.compute_logits(hidden_states)
+        self.assertTrue(torch.isfinite(hidden_states).all())
+        self.assertTrue(torch.isfinite(logits).all())
+
+    def test_auto_from_pretrained_initializes_missing_mask_hidden(self):
+        model = LlamaForCausalLMEagle3(self.config)
+        state_dict = model.state_dict()
+        del state_dict["mask_hidden"]
+        torch.save(state_dict, os.path.join(self.temp_dir, "pytorch_model.bin"))
+
+        config_dict = self.config.to_dict()
+        config_dict["architectures"] = ["LlamaForCausalLMEagle3"]
+        with open(os.path.join(self.temp_dir, "config.json"), "w", encoding="utf-8") as f:
+            import json
+
+            json.dump(config_dict, f)
+
+        loaded = AutoEagle3DraftModel.from_pretrained(self.temp_dir, torch_dtype=torch.bfloat16)
+        self.assertTrue(torch.isfinite(loaded.mask_hidden).all())
+        self.assertTrue(torch.equal(loaded.mask_hidden, torch.zeros_like(loaded.mask_hidden)))
+        self.assertTrue(
+            torch.equal(
+                loaded.embed_tokens.weight[loaded.mask_token_id],
+                torch.zeros_like(loaded.embed_tokens.weight[loaded.mask_token_id]),
+            )
+        )
 
 
 if __name__ == "__main__":

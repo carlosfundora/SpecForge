@@ -38,6 +38,22 @@ class Eagle3Model(nn.Module):
 
 
 class OnlineEagle3Model(Eagle3Model):
+
+    @staticmethod
+    def _require_finite(tensor: torch.Tensor, name: str) -> None:
+        finite = torch.isfinite(tensor)
+        if finite.all():
+            return
+        finite_values = tensor[finite]
+        finite_absmax = (
+            float(finite_values.abs().max().item()) if finite_values.numel() else float("nan")
+        )
+        raise RuntimeError(
+            f"P-EAGLE produced non-finite values at {name}: "
+            f"finite={int(finite.sum().item())}/{tensor.numel()} "
+            f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"finite_absmax={finite_absmax}"
+        )
     """
     In sgl-spec, we implement offline/online training.
     Online training means we have the target hidden_states available during training.
@@ -206,11 +222,13 @@ class OnlineEagle3Model(Eagle3Model):
                 raise NotImplementedError(
                     "P-EAGLE training currently supports the sdpa attention backend only."
                 )
+            self._require_finite(fused_hidden_states, "fused_hidden_states")
 
             flat_last_token_ids = input_ids.reshape(batch_size * seq_length, 1)
             flat_fused_hidden_states = fused_hidden_states.reshape(
                 batch_size * seq_length, 1, fused_hidden_states.shape[-1]
             )
+            flat_position_ids = position_ids.reshape(batch_size * seq_length, 1)
             (
                 parallel_hidden_states,
                 parallel_input_embeds,
@@ -220,14 +238,14 @@ class OnlineEagle3Model(Eagle3Model):
                 flat_last_token_ids,
                 flat_fused_hidden_states,
                 self.length,
+                base_position_ids=flat_position_ids,
             )
-            parallel_attention_mask = self.draft_model.prepare_decoder_attention_mask(
-                attention_mask=parallel_attention_mask,
-                hidden_states=parallel_hidden_states,
-                batch_size=parallel_hidden_states.shape[0],
-                seq_length=self.length,
-                past_key_values_length=0,
-            )
+            self._require_finite(parallel_hidden_states, "prepare_p_eagle_inputs.hidden_states")
+            self._require_finite(parallel_input_embeds, "prepare_p_eagle_inputs.input_embeds")
+            # P-EAGLE's single-pass branch has no padding in the expanded k-length
+            # sequence. Let SDPA apply the causal mask natively instead of
+            # materializing an additive mask, which has been unstable on ROCm.
+            parallel_attention_mask = None
             parallel_input_embeds = parallel_input_embeds.to(parallel_hidden_states.dtype)
             parallel_hidden_states = self.draft_model.backbone(
                 input_embeds=parallel_input_embeds,
@@ -238,9 +256,11 @@ class OnlineEagle3Model(Eagle3Model):
                 past_key_values=None,
                 use_cache=False,
             )
+            self._require_finite(parallel_hidden_states, "draft_model.backbone")
             logits = self.draft_model.compute_logits(parallel_hidden_states).view(
                 batch_size, seq_length, self.length, -1
             )
+            self._require_finite(logits, "draft_model.compute_logits")
 
             plosses = []
             acces = []

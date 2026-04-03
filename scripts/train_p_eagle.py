@@ -1,8 +1,11 @@
 import argparse
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -15,6 +18,14 @@ FORKS_ROOT = ROOT_DIR.parent
 THOTH_ROOT = FORKS_ROOT.parent
 SGLANG_PYTHON_DIR = FORKS_ROOT / "sglang" / "python"
 DEFAULT_THOTH_ARTIFACT_ROOT = THOTH_ROOT / "artifacts" / "models" / "local"
+KILL_PATTERNS = (
+    re.compile(r"llama-server"),
+    re.compile(r"sglang\.launch_server"),
+    re.compile(r"torch\.distributed\.run.*train_eagle3\.py"),
+    re.compile(r"python.*train_eagle3\.py"),
+    re.compile(r"python.*train_p_eagle\.py"),
+    re.compile(r"/home/local/Projects/THOTH/forks/SpecForge"),
+)
 
 
 PROFILES = {
@@ -145,7 +156,125 @@ def parse_args():
         action="store_true",
         help="Print the resolved commands without executing them.",
     )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip the host preflight and competing-process check.",
+    )
+    parser.add_argument(
+        "--skip-kill-competing",
+        action="store_true",
+        help="Report competing training/model-serving processes without stopping them.",
+    )
     return parser.parse_args()
+
+
+def _meminfo_gib() -> tuple[float, float]:
+    mem_total = 0
+    mem_available = 0
+    with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("MemTotal:"):
+                mem_total = int(line.split()[1])
+            elif line.startswith("MemAvailable:"):
+                mem_available = int(line.split()[1])
+    return mem_total / (1024 * 1024), mem_available / (1024 * 1024)
+
+
+def _gpu_summary() -> str:
+    rocminfo = "/opt/rocm/bin/rocminfo"
+    if not os.path.exists(rocminfo):
+        return "rocminfo unavailable"
+    try:
+        result = subprocess.run(
+            [rocminfo],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return f"rocminfo failed: {exc}"
+
+    for line in result.stdout.splitlines():
+        if "gfx1030" in line:
+            return line.strip()
+    return "gfx1030 not found in rocminfo output"
+
+
+def _list_competing_processes() -> list[tuple[int, str]]:
+    current_pid = os.getpid()
+    parent_pid = os.getppid()
+    result = subprocess.run(
+        ["ps", "-eo", "pid,args", "--no-headers"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    matches: list[tuple[int, str]] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_text, args = line.split(None, 1)
+        except ValueError:
+            continue
+        pid = int(pid_text)
+        if pid in {current_pid, parent_pid}:
+            continue
+        if any(pattern.search(args) for pattern in KILL_PATTERNS):
+            matches.append((pid, args))
+    return matches
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _kill_processes(processes: list[tuple[int, str]]) -> None:
+    if not processes:
+        return
+    for pid, _ in processes:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+    deadline = time.time() + 5
+    remaining = {pid for pid, _ in processes}
+    while remaining and time.time() < deadline:
+        remaining = {pid for pid in remaining if _pid_alive(pid)}
+        time.sleep(0.2)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+
+
+def run_preflight(skip_kill: bool) -> None:
+    total_gib, avail_gib = _meminfo_gib()
+    print(f"Host RAM: total={total_gib:.1f} GiB available={avail_gib:.1f} GiB")
+    print(f"GPU visibility: {_gpu_summary()}")
+    competing = _list_competing_processes()
+    if competing:
+        print("Competing training/model-serving processes:")
+        for pid, args in competing:
+            print(f"  PID {pid}: {args}")
+        if not skip_kill:
+            _kill_processes(competing)
+            remaining = _list_competing_processes()
+            if remaining:
+                raise RuntimeError(
+                    "Failed to clear all competing training/model-serving processes: "
+                    + ", ".join(f"{pid}" for pid, _ in remaining)
+                )
+            print("Competing processes terminated.")
+    else:
+        print("No competing training/model-serving processes detected.")
 
 
 def maybe_prepare_dataset(dataset_name: str, train_data_path: str, cache_dir: str, dry_run: bool):
@@ -338,6 +467,9 @@ def main():
 
     if args.dry_run:
         return
+
+    if not args.skip_preflight:
+        run_preflight(skip_kill=args.skip_kill_competing)
 
     subprocess.run(train_cmd, check=True, cwd=str(ROOT_DIR), env=env)
 

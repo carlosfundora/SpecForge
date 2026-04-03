@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 from typing import Optional, Union
 
 import torch
@@ -64,6 +65,13 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         *model_args,
         **kwargs,
     ):
+        ckpt_declares_parallel = True
+        config_path = os.path.join(pretrained_model_name_or_path, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as fh:
+                raw_config = json.load(fh)
+            ckpt_declares_parallel = "parallel_drafting" in raw_config and "mask_token_id" in raw_config
+
         original_warn = modeling_utils.logger.warning
 
         def filtered_warning(msg):
@@ -79,6 +87,29 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
             )
         finally:
             modeling_utils.logger.warning = original_warn
+
+        if hasattr(model, "mask_hidden") and (
+            not ckpt_declares_parallel or not torch.isfinite(model.mask_hidden).all()
+        ):
+            reason = (
+                "checkpoint predates P-EAGLE metadata"
+                if not ckpt_declares_parallel
+                else "mask_hidden is non-finite"
+            )
+            warnings.warn(
+                f"Resetting mask_hidden to zeros because the loaded draft {reason}.",
+                stacklevel=2,
+            )
+            with torch.no_grad():
+                model.mask_hidden.zero_()
+                if (
+                    not ckpt_declares_parallel
+                    and getattr(model.config, "parallel_drafting", False)
+                    and hasattr(model, "embed_tokens")
+                ):
+                    mask_token_id = int(getattr(model.config, "mask_token_id", 0))
+                    if 0 <= mask_token_id < model.embed_tokens.weight.shape[0]:
+                        model.embed_tokens.weight[mask_token_id].zero_()
 
         return model
 

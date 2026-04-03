@@ -39,6 +39,36 @@ except ImportError:
     flash_attn_func = None
 
 
+def _raise_if_non_finite(tensor: torch.Tensor, name: str) -> None:
+    finite = torch.isfinite(tensor)
+    if finite.all():
+        return
+    finite_values = tensor[finite]
+    finite_absmax = (
+        float(finite_values.abs().max().item()) if finite_values.numel() else float("nan")
+    )
+    pos_debug = ""
+    if tensor.dim() == 3:
+        bad_tokens = (~finite.all(dim=-1)).sum(dim=0).tolist()
+        pos_debug = f" bad_tokens_by_pos={bad_tokens}"
+    elif tensor.dim() == 4:
+        bad_tokens = (~finite.all(dim=-1).all(dim=1)).sum(dim=0).tolist()
+        pos_debug = f" bad_tokens_by_pos={bad_tokens}"
+    raise RuntimeError(
+        f"Non-finite tensor at {name}: "
+        f"finite={int(finite.sum().item())}/{tensor.numel()} "
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"finite_absmax={finite_absmax}{pos_debug}"
+    )
+
+
+def _finite_absmax(tensor: torch.Tensor) -> float:
+    finite = torch.isfinite(tensor)
+    if not finite.any():
+        return float("nan")
+    return float(tensor[finite].abs().max().item())
+
+
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
     input_ids_shape: torch.Size,
@@ -108,7 +138,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True)
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
@@ -278,7 +307,6 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
-    @torch.compile(dynamic=True)
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len and seq_len > self.max_seq_len_cached:
@@ -513,6 +541,44 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
             persistent=False,
         )
 
+    def forward(self, x, seq_len=None):
+        seq_len = seq_len or x.shape[-2]
+        dim = self.dim
+        cpu_device = torch.device("cpu")
+
+        freq_extra = 1.0 / (
+            self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=cpu_device) / dim)
+        )
+        freq_inter = 1.0 / (
+            self.scaling_factor
+            * self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=cpu_device) / dim)
+        )
+
+        low, high = yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            dim,
+            self.base,
+            self.original_max_position_embeddings,
+        )
+        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
+            device=cpu_device, dtype=torch.float32
+        )
+        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+
+        t = torch.arange(seq_len, device=cpu_device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        _mscale = float(
+            yarn_get_mscale(self.scaling_factor, self.mscale)
+            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+        )
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = (emb.cos() * _mscale)[None, None, :, :].to(device=x.device, dtype=x.dtype)
+        sin = (emb.sin() * _mscale)[None, None, :, :].to(device=x.device, dtype=x.dtype)
+        return cos, sin
+
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -542,6 +608,13 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
+        self.use_qk_norm = bool(getattr(config, "use_qk_norm", False))
+        if self.use_qk_norm:
+            self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
         self._init_rope()
 
     def _init_rope(self):
@@ -559,6 +632,13 @@ class LlamaAttention(nn.Module):
                     return rope_scaling.get(key, default)
                 return getattr(rope_scaling, key, default)
 
+            rope_base = rope_get(
+                "rope_theta",
+                getattr(self.config, "rope_theta", 10000),
+            )
+            if rope_base is None:
+                rope_base = 10000
+
             scaling_type = rope_get("rope_type", rope_get("type"))
             scaling_factor = rope_get("factor")
 
@@ -566,7 +646,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_base,
                 )
                 return
             elif scaling_type == "linear":
@@ -594,7 +674,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_base,
                     scaling_factor=(
                         scaling_factor if scaling_factor is not None else 1.0
                     ),
@@ -610,14 +690,15 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_base,
                     original_max_position_embeddings=rope_get(
-                        "original_max_position_embeddings"
+                        "original_max_position_embeddings", 4096
                     ),
                     scaling_factor=scaling_factor,
-                    beta_fast=rope_get("beta_fast"),
-                    beta_slow=rope_get("beta_slow"),
-                    mscale=rope_get("mscale"),
-                    mscale_all_dim=rope_get("mscale_all_dim"),
+                    beta_fast=rope_get("beta_fast", 32),
+                    beta_slow=rope_get("beta_slow", 1),
+                    mscale=rope_get("mscale", 1),
+                    mscale_all_dim=rope_get("mscale_all_dim", 0),
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -640,10 +721,27 @@ class LlamaAttention(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
+        _raise_if_non_finite(hidden_states, "LlamaAttention.hidden_states")
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        proj_input = hidden_states.float()
+        query_states = F.linear(
+            proj_input,
+            self.q_proj.weight.float(),
+            self.q_proj.bias.float() if self.q_proj.bias is not None else None,
+        )
+        key_states = F.linear(
+            proj_input,
+            self.k_proj.weight.float(),
+            self.k_proj.bias.float() if self.k_proj.bias is not None else None,
+        )
+        value_states = F.linear(
+            proj_input,
+            self.v_proj.weight.float(),
+            self.v_proj.bias.float() if self.v_proj.bias is not None else None,
+        )
+        _raise_if_non_finite(query_states, "LlamaAttention.q_proj")
+        _raise_if_non_finite(key_states, "LlamaAttention.k_proj")
+        _raise_if_non_finite(value_states, "LlamaAttention.v_proj")
 
         query_states = query_states.view(
             bsz, q_len, self.num_heads, self.head_dim
@@ -654,6 +752,11 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
+        if self.use_qk_norm:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+            _raise_if_non_finite(query_states, "LlamaAttention.q_norm")
+            _raise_if_non_finite(key_states, "LlamaAttention.k_norm")
 
         if cache_hidden is None:
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
@@ -667,23 +770,72 @@ class LlamaAttention(nn.Module):
                     self.config.rope_scaling["mrope_section"],
                 )
             else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len)
+                rotary_seq_len = (
+                    int(position_ids.max().item()) + 1
+                    if position_ids is not None
+                    else q_len
+                )
+                rotary_seq_len = max(rotary_seq_len, q_len)
+                cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_pre_rope_absmax = _finite_absmax(query_states)
+                key_pre_rope_absmax = _finite_absmax(key_states)
+                cos_absmax = _finite_absmax(cos)
+                sin_absmax = _finite_absmax(sin)
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, position_ids
+                )
+            if not torch.isfinite(query_states).all():
+                pos_min = int(position_ids.min().item()) if position_ids is not None else -1
+                pos_max = int(position_ids.max().item()) if position_ids is not None else -1
+                raise RuntimeError(
+                    "Non-finite tensor at LlamaAttention.query_after_rope: "
+                    f"finite={int(torch.isfinite(query_states).sum().item())}/{query_states.numel()} "
+                    f"shape={tuple(query_states.shape)} dtype={query_states.dtype} "
+                    f"finite_absmax={_finite_absmax(query_states)} "
+                    f"pre_q_absmax={query_pre_rope_absmax} pre_k_absmax={key_pre_rope_absmax} "
+                    f"cos_absmax={cos_absmax} sin_absmax={sin_absmax} "
+                    f"rope_type={getattr(self.rotary_emb, '__class__', type(self.rotary_emb)).__name__} "
+                    f"pos_range=[{pos_min},{pos_max}]"
+                )
+            if not torch.isfinite(key_states).all():
+                pos_min = int(position_ids.min().item()) if position_ids is not None else -1
+                pos_max = int(position_ids.max().item()) if position_ids is not None else -1
+                raise RuntimeError(
+                    "Non-finite tensor at LlamaAttention.key_after_rope: "
+                    f"finite={int(torch.isfinite(key_states).sum().item())}/{key_states.numel()} "
+                    f"shape={tuple(key_states.shape)} dtype={key_states.dtype} "
+                    f"finite_absmax={_finite_absmax(key_states)} "
+                    f"pre_q_absmax={query_pre_rope_absmax} pre_k_absmax={key_pre_rope_absmax} "
+                    f"cos_absmax={cos_absmax} sin_absmax={sin_absmax} "
+                    f"rope_type={getattr(self.rotary_emb, '__class__', type(self.rotary_emb)).__name__} "
+                    f"pos_range=[{pos_min},{pos_max}]"
                 )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attention_mask,
-                is_causal=attention_mask is None,
-                dropout_p=0.0,
+            q_attn = query_states.float()
+            k_attn = key_states.float()
+            v_attn = value_states.float()
+            attn_weights = torch.matmul(q_attn, k_attn.transpose(2, 3)) / math.sqrt(
+                self.head_dim
             )
+            causal_mask = torch.full(
+                (q_len, q_len),
+                torch.finfo(attn_weights.dtype).min,
+                device=attn_weights.device,
+                dtype=attn_weights.dtype,
+            )
+            causal_mask = torch.triu(causal_mask, diagonal=1)
+            attn_weights = attn_weights + causal_mask.view(1, 1, q_len, q_len)
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask.float()
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            )
+            _raise_if_non_finite(attn_weights, "LlamaAttention.attn_weights")
+            attn_output = torch.matmul(attn_weights, v_attn).to(query_states.dtype)
+            _raise_if_non_finite(attn_output, "LlamaAttention.sdpa_output")
 
         else:
             lck = len(cache_hidden[0])
@@ -698,10 +850,17 @@ class LlamaAttention(nn.Module):
                     self.config.rope_scaling["mrope_section"],
                 )
             else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+                effective_position_ids = position_ids + lck if position_ids is not None else None
+                rotary_seq_len = (
+                    int(effective_position_ids.max().item()) + 1
+                    if effective_position_ids is not None
+                    else q_len + lck
+                )
+                rotary_seq_len = max(rotary_seq_len, q_len + lck)
+                cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids + lck
+                    query_states, key_states, cos, sin, effective_position_ids
                 )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -713,20 +872,23 @@ class LlamaAttention(nn.Module):
             cache_k = cache_hidden[0]
             cache_v = cache_hidden[1]
 
-            k0 = cache_k[0]
-            v0 = cache_v[0]
+            q_attn = query_states.float()
+            k0 = cache_k[0].float()
+            v0 = cache_v[0].float()
+            attn_mask = attention_mask.float() if attention_mask is not None else None
 
             # causal
-            attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(
+            attn_weights = torch.matmul(q_attn, k0.transpose(2, 3)) / math.sqrt(
                 self.head_dim
             )
             lck = len(cache_k)
 
-            attn_weights = attn_weights + attention_mask
+            if attn_mask is not None:
+                attn_weights = attn_weights + attn_mask
 
             for i in range(1, lck):
-                ki = cache_k[i]
-                qi = query_states
+                ki = cache_k[i].float()
+                qi = q_attn
                 kiq = ki
 
                 attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
@@ -737,21 +899,25 @@ class LlamaAttention(nn.Module):
             # upcast attention to fp32
             attn_weights = nn.functional.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
-            ).to(query_states.dtype)
+            )
             attn_weights0 = attn_weights[..., :q_len]
 
             attn_output = torch.matmul(attn_weights0, v0)
 
             for i in range(1, lck):
-                vi = cache_v[i]
+                vi = cache_v[i].float()
                 attn_weightsi = attn_weights[..., q_len + i - 1]
                 attn_outputi = attn_weightsi[..., None] * vi
                 attn_output = attn_output + attn_outputi
+            attn_output = attn_output.to(query_states.dtype)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
-
-        attn_output = self.o_proj(attn_output)
+        attn_output = F.linear(
+            attn_output.float(),
+            self.o_proj.weight.float(),
+            self.o_proj.bias.float() if self.o_proj.bias is not None else None,
+        ).to(hidden_states.dtype)
 
         return attn_output
 
@@ -1295,11 +1461,16 @@ class LlamaDecoderLayer(nn.Module):
         """
 
         residual = hidden_states
+        _raise_if_non_finite(hidden_states, "LlamaDecoderLayer.hidden_states_in")
+        _raise_if_non_finite(input_emb, "LlamaDecoderLayer.input_emb_in")
 
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
+        _raise_if_non_finite(hidden_states, "LlamaDecoderLayer.hidden_norm")
+        _raise_if_non_finite(input_emb, "LlamaDecoderLayer.input_layernorm")
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        _raise_if_non_finite(hidden_states, "LlamaDecoderLayer.concat")
         # Self Attention
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
@@ -1310,13 +1481,18 @@ class LlamaDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+        _raise_if_non_finite(hidden_states, "LlamaDecoderLayer.self_attn")
         hidden_states = residual + hidden_states
+        _raise_if_non_finite(hidden_states, "LlamaDecoderLayer.attn_residual")
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _raise_if_non_finite(hidden_states, "LlamaDecoderLayer.post_attention_layernorm")
         hidden_states = self.mlp(hidden_states)
+        _raise_if_non_finite(hidden_states, "LlamaDecoderLayer.mlp")
         hidden_states = residual + hidden_states
+        _raise_if_non_finite(hidden_states, "LlamaDecoderLayer.mlp_residual")
 
         # outputs = (hidden_states, return_hidden)
         return hidden_states
@@ -1452,6 +1628,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         last_token_ids: torch.Tensor,
         fused_hidden_states: torch.Tensor,
         k: int,
+        base_position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
@@ -1473,6 +1650,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             raise ValueError(
                 f"Expected fused hidden size {expected_hidden}, got {fused_hidden_states.shape[-1]}"
             )
+
+        if base_position_ids is not None:
+            if base_position_ids.dim() == 1:
+                base_position_ids = base_position_ids.unsqueeze(-1)
+            if base_position_ids.dim() != 2 or base_position_ids.shape[1] != 1:
+                raise ValueError(
+                    "base_position_ids must have shape [batch, 1] for P-EAGLE input construction"
+                )
+            if base_position_ids.shape[0] != last_token_ids.shape[0]:
+                raise ValueError(
+                    "base_position_ids batch dimension must match last_token_ids batch dimension"
+                )
 
         batch = last_token_ids.shape[0]
         device = last_token_ids.device
@@ -1499,8 +1688,11 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         attention_mask = torch.ones(
             (batch, k), dtype=torch.bool, device=projected_hidden_states.device
         )
-        position_ids = torch.arange(k, device=device, dtype=torch.long).unsqueeze(0)
-        position_ids = position_ids.expand(batch, -1)
+        position_offsets = torch.arange(k, device=device, dtype=torch.long).unsqueeze(0)
+        if base_position_ids is None:
+            position_ids = position_offsets.expand(batch, -1)
+        else:
+            position_ids = base_position_ids.to(device=device, dtype=torch.long) + position_offsets
 
         return projected_hidden_states, input_embeds, attention_mask, position_ids
 
