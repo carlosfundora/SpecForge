@@ -52,6 +52,35 @@ PROFILES = {
         "train_data_path": str(DEFAULT_DATASET_DIR / "sharegpt_train.jsonl"),
         "dataset_name": "sharegpt",
     },
+    "bonsai17_full5": {
+        "target_model_path": "prism-ml/Bonsai-1.7B-unpacked",
+        "target_model_note": (
+            "Full 5-epoch Bonsai P-EAGLE training from the validated smoke checkpoint."
+        ),
+        "chat_template": "qwen",
+        "max_length": 512,
+        "embedding_key": "model.embed_tokens.weight",
+        "target_model_backend": "hf",
+        "attention_backend": "sdpa",
+        "train_mask_hidden_only": False,
+        "default_k_train": 5,
+        "default_ttt_length": 5,
+        "default_num_epochs": 5,
+        "default_max_num_steps": None,
+        "default_sample_limit": None,
+        "warm_start_ckpt": str(
+            DEFAULT_THOTH_ARTIFACT_ROOT
+            / "Bonsai-1.7B-P-EAGLE-local-smoke"
+            / "epoch_0_step_500"
+        ),
+        "output_dir": str(
+            DEFAULT_MODEL_REGISTRY / "local" / "Bonsai-1.7B-P-EAGLE-local"
+        ),
+        "train_data_path": str(DEFAULT_DATASET_DIR / "sharegpt_train.jsonl"),
+        "dataset_name": "sharegpt",
+        "default_save_interval": 500,
+        "default_log_interval": 10,
+    },
     "bonsai17_smoke": {
         "target_model_path": "prism-ml/Bonsai-1.7B-unpacked",
         "target_model_note": (
@@ -77,6 +106,8 @@ PROFILES = {
         ),
         "train_data_path": str(DEFAULT_DATASET_DIR / "sharegpt_train.jsonl"),
         "dataset_name": "sharegpt",
+        "default_save_interval": 500,
+        "default_log_interval": 10,
     },
     "opcoder15": {
         "target_model_path": str(
@@ -103,6 +134,36 @@ PROFILES = {
         "train_data_path": str(DEFAULT_DATASET_DIR / "sharegpt_train.jsonl"),
         "dataset_name": "sharegpt",
     },
+    "opcoder15_opc": {
+        "target_model_path": str(
+            DEFAULT_MODEL_REGISTRY / "infly" / "OpenCoder-1.5B-Instruct" / "weights"
+        ),
+        "target_model_note": (
+            "Full 5-epoch OpenCoder P-EAGLE training on OPC Stage1."
+        ),
+        "chat_template": "llama3",
+        "max_length": 4096,
+        "embedding_key": "model.embed_tokens.weight",
+        "target_model_backend": "hf",
+        "attention_backend": "flex_attention",
+        "train_mask_hidden_only": False,
+        "default_k_train": 8,
+        "default_ttt_length": 7,
+        "default_num_epochs": 5,
+        "default_max_num_steps": None,
+        "default_sample_limit": None,
+        "warm_start_ckpt": str(
+            DEFAULT_MODEL_REGISTRY / "local" / "OpenCoder-1.5B-EAGLE3-local" / "weights"
+        ),
+        "output_dir": str(
+            DEFAULT_MODEL_REGISTRY / "local" / "OpenCoder-1.5B-P-EAGLE-local"
+        ),
+        "train_data_path": str(DEFAULT_DATASET_DIR / "opc_train.jsonl"),
+        "dataset_name": "opc",
+        "default_opc_subset": "largescale_diverse_instruct",
+        "default_save_interval": 500,
+        "default_log_interval": 10,
+    },
 }
 
 
@@ -121,6 +182,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--train-data-path", type=str, default=None)
     parser.add_argument("--dataset-name", type=str, default=None)
+    parser.add_argument("--opc-subset", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default=str(DEFAULT_CACHE_DIR))
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--tp-size", type=int, default=1)
@@ -136,10 +198,11 @@ def parse_args():
     parser.add_argument("--ttt-length", type=int, default=None)
     parser.add_argument("--cod-retention", type=float, default=0.8)
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
-    parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--save-interval", type=int, default=5000)
+    parser.add_argument("--log-interval", type=int, default=None)
+    parser.add_argument("--save-interval", type=int, default=None)
     parser.add_argument("--eval-interval", type=int, default=5000)
     parser.add_argument("--max-num-steps", type=int, default=None)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--sample-limit",
         type=int,
@@ -277,7 +340,13 @@ def run_preflight(skip_kill: bool) -> None:
         print("No competing training/model-serving processes detected.")
 
 
-def maybe_prepare_dataset(dataset_name: str, train_data_path: str, cache_dir: str, dry_run: bool):
+def maybe_prepare_dataset(
+    dataset_name: str,
+    train_data_path: str,
+    cache_dir: str,
+    dry_run: bool,
+    opc_subset: str | None = None,
+):
     if os.path.exists(train_data_path):
         return
 
@@ -291,6 +360,8 @@ def maybe_prepare_dataset(dataset_name: str, train_data_path: str, cache_dir: st
         "--output-path",
         str(output_path),
     ]
+    if dataset_name == "opc" and opc_subset is not None:
+        cmd.extend(["--opc-subset", opc_subset])
     if dry_run:
         print("DATASET CMD:", " ".join(cmd))
         return
@@ -342,6 +413,7 @@ def main():
     output_dir = args.output_dir or profile["output_dir"]
     train_data_path = args.train_data_path or profile["train_data_path"]
     dataset_name = args.dataset_name or profile["dataset_name"]
+    opc_subset = args.opc_subset or profile.get("default_opc_subset")
     max_length = args.max_length or profile["max_length"]
     attention_backend = args.attention_backend or profile["attention_backend"]
     train_mask_hidden_only = (
@@ -359,6 +431,16 @@ def main():
         if args.max_num_steps is not None
         else profile["default_max_num_steps"]
     )
+    save_interval = (
+        args.save_interval
+        if args.save_interval is not None
+        else profile.get("default_save_interval", 5000)
+    )
+    log_interval = (
+        args.log_interval
+        if args.log_interval is not None
+        else profile.get("default_log_interval", 10)
+    )
     sample_limit = (
         args.sample_limit if args.sample_limit is not None else profile["default_sample_limit"]
     )
@@ -369,6 +451,7 @@ def main():
             train_data_path=train_data_path,
             cache_dir=args.cache_dir,
             dry_run=args.dry_run,
+            opc_subset=opc_subset,
         )
     train_data_path = maybe_materialize_sampled_dataset(
         source_path=train_data_path,
@@ -444,24 +527,28 @@ def main():
         "--cod-retention",
         str(args.cod_retention),
         "--log-interval",
-        str(args.log_interval),
+        str(log_interval),
         "--save-interval",
-        str(args.save_interval),
+        str(save_interval),
         "--eval-interval",
         str(args.eval_interval),
     ]
     if max_num_steps is not None:
         train_cmd.extend(["--max-num-steps", str(max_num_steps)])
+    if args.resume:
+        train_cmd.append("--resume")
 
     print(f"Profile: {args.profile}")
     print(f"Target model path: {target_model_path}")
     print(f"Target model note: {profile['target_model_note']}")
     print(f"Warm-start EAGLE3 head: {eagle3_head}")
     print(f"Train data path: {train_data_path}")
+    print(f"OPC subset: {opc_subset}")
     print(f"Sample limit: {sample_limit}")
     print(f"Attention backend: {attention_backend}")
     print(f"Train mask_hidden only: {train_mask_hidden_only}")
     print(f"TTT length: {ttt_length}")
+    print(f"Resume: {args.resume}")
     print(f"Output dir: {output_dir}")
     print("TRAIN CMD:", " ".join(train_cmd))
 
