@@ -40,33 +40,48 @@ except ImportError:
 
 
 def _raise_if_non_finite(tensor: torch.Tensor, name: str) -> None:
-    finite = torch.isfinite(tensor)
-    if finite.all():
+    min_value, max_value = torch.aminmax(tensor)
+    if bool(torch.isfinite(min_value) and torch.isfinite(max_value)):
         return
-    finite_values = tensor[finite]
-    finite_absmax = (
-        float(finite_values.abs().max().item()) if finite_values.numel() else float("nan")
-    )
-    pos_debug = ""
-    if tensor.dim() == 3:
-        bad_tokens = (~finite.all(dim=-1)).sum(dim=0).tolist()
-        pos_debug = f" bad_tokens_by_pos={bad_tokens}"
-    elif tensor.dim() == 4:
-        bad_tokens = (~finite.all(dim=-1).all(dim=1)).sum(dim=0).tolist()
-        pos_debug = f" bad_tokens_by_pos={bad_tokens}"
+    flat_tensor = tensor.reshape(-1)
+    chunk_size = 1 << 20
+    finite_count = 0
+    finite_absmax = float("nan")
+    for start in range(0, flat_tensor.numel(), chunk_size):
+        chunk = flat_tensor[start : start + chunk_size]
+        finite_mask = torch.isfinite(chunk)
+        chunk_finite = int(finite_mask.sum().item())
+        finite_count += chunk_finite
+        if chunk_finite == 0:
+            continue
+        finite_values = chunk[finite_mask]
+        chunk_absmax = float(finite_values.abs().max().item())
+        if finite_absmax != finite_absmax or chunk_absmax > finite_absmax:
+            finite_absmax = chunk_absmax
     raise RuntimeError(
         f"Non-finite tensor at {name}: "
-        f"finite={int(finite.sum().item())}/{tensor.numel()} "
+        f"finite={finite_count}/{tensor.numel()} "
         f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-        f"finite_absmax={finite_absmax}{pos_debug}"
+        f"finite_absmax={finite_absmax}"
     )
 
 
 def _finite_absmax(tensor: torch.Tensor) -> float:
-    finite = torch.isfinite(tensor)
-    if not finite.any():
-        return float("nan")
-    return float(tensor[finite].abs().max().item())
+    min_value, max_value = torch.aminmax(tensor)
+    if not bool(torch.isfinite(min_value) and torch.isfinite(max_value)):
+        flat_tensor = tensor.reshape(-1)
+        chunk_size = 1 << 20
+        finite_absmax = float("nan")
+        for start in range(0, flat_tensor.numel(), chunk_size):
+            chunk = flat_tensor[start : start + chunk_size]
+            finite_mask = torch.isfinite(chunk)
+            if not bool(finite_mask.any()):
+                continue
+            chunk_absmax = float(chunk[finite_mask].abs().max().item())
+            if finite_absmax != finite_absmax or chunk_absmax > finite_absmax:
+                finite_absmax = chunk_absmax
+        return finite_absmax
+    return float(torch.maximum(min_value.abs(), max_value.abs()).item())
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -785,27 +800,25 @@ class LlamaAttention(nn.Module):
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, position_ids
                 )
-            if not torch.isfinite(query_states).all():
+            if not bool(torch.isfinite(torch.aminmax(query_states)[0]) and torch.isfinite(torch.aminmax(query_states)[1])):
                 pos_min = int(position_ids.min().item()) if position_ids is not None else -1
                 pos_max = int(position_ids.max().item()) if position_ids is not None else -1
                 raise RuntimeError(
                     "Non-finite tensor at LlamaAttention.query_after_rope: "
-                    f"finite={int(torch.isfinite(query_states).sum().item())}/{query_states.numel()} "
-                    f"shape={tuple(query_states.shape)} dtype={query_states.dtype} "
                     f"finite_absmax={_finite_absmax(query_states)} "
+                    f"shape={tuple(query_states.shape)} dtype={query_states.dtype} "
                     f"pre_q_absmax={query_pre_rope_absmax} pre_k_absmax={key_pre_rope_absmax} "
                     f"cos_absmax={cos_absmax} sin_absmax={sin_absmax} "
                     f"rope_type={getattr(self.rotary_emb, '__class__', type(self.rotary_emb)).__name__} "
                     f"pos_range=[{pos_min},{pos_max}]"
                 )
-            if not torch.isfinite(key_states).all():
+            if not bool(torch.isfinite(torch.aminmax(key_states)[0]) and torch.isfinite(torch.aminmax(key_states)[1])):
                 pos_min = int(position_ids.min().item()) if position_ids is not None else -1
                 pos_max = int(position_ids.max().item()) if position_ids is not None else -1
                 raise RuntimeError(
                     "Non-finite tensor at LlamaAttention.key_after_rope: "
-                    f"finite={int(torch.isfinite(key_states).sum().item())}/{key_states.numel()} "
-                    f"shape={tuple(key_states.shape)} dtype={key_states.dtype} "
                     f"finite_absmax={_finite_absmax(key_states)} "
+                    f"shape={tuple(key_states.shape)} dtype={key_states.dtype} "
                     f"pre_q_absmax={query_pre_rope_absmax} pre_k_absmax={key_pre_rope_absmax} "
                     f"cos_absmax={cos_absmax} sin_absmax={sin_absmax} "
                     f"rope_type={getattr(self.rotary_emb, '__class__', type(self.rotary_emb)).__name__} "
@@ -1525,6 +1538,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
+        self.mask_token_embedding = nn.Parameter(torch.zeros(config.hidden_size))
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
         if hasattr(config, "target_hidden_size"):
@@ -1550,8 +1564,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     def freeze_embedding(self) -> None:
         if self.parallel_drafting:
-            # P-EAGLE learns a dedicated mask token row; keep embeddings trainable.
-            self.embed_tokens.weight.requires_grad = True
+            # P-EAGLE only needs a dedicated learned mask token embedding.
+            self.embed_tokens.weight.requires_grad = False
+            self.mask_token_embedding.requires_grad = True
             return
         super().freeze_embedding()
 
@@ -1612,7 +1627,19 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        input_embeds = self.embed_tokens(input_ids)
+        if not self.parallel_drafting:
+            return input_embeds
+
+        mask_positions = input_ids == self.mask_token_id
+        if not bool(mask_positions.any()):
+            return input_embeds
+
+        input_embeds = input_embeds.clone()
+        input_embeds[mask_positions] = self.mask_token_embedding.to(
+            device=input_embeds.device, dtype=input_embeds.dtype
+        )
+        return input_embeds
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers

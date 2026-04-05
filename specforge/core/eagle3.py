@@ -40,17 +40,34 @@ class Eagle3Model(nn.Module):
 class OnlineEagle3Model(Eagle3Model):
 
     @staticmethod
-    def _require_finite(tensor: torch.Tensor, name: str) -> None:
-        finite = torch.isfinite(tensor)
-        if finite.all():
+    def _tensor_has_only_finite_values(tensor: torch.Tensor) -> bool:
+        min_value, max_value = torch.aminmax(tensor)
+        return bool(torch.isfinite(min_value) and torch.isfinite(max_value))
+
+    @classmethod
+    def _require_finite(cls, tensor: torch.Tensor, name: str) -> None:
+        if cls._tensor_has_only_finite_values(tensor):
             return
-        finite_values = tensor[finite]
-        finite_absmax = (
-            float(finite_values.abs().max().item()) if finite_values.numel() else float("nan")
-        )
+        flat_tensor = tensor.reshape(-1)
+        chunk_size = 1 << 20
+        finite_count = 0
+        finite_absmax = float("nan")
+
+        for start in range(0, flat_tensor.numel(), chunk_size):
+            chunk = flat_tensor[start : start + chunk_size]
+            finite_mask = torch.isfinite(chunk)
+            chunk_finite = int(finite_mask.sum().item())
+            finite_count += chunk_finite
+            if chunk_finite == 0:
+                continue
+            finite_values = chunk[finite_mask]
+            chunk_absmax = float(finite_values.abs().max().item())
+            if finite_absmax != finite_absmax or chunk_absmax > finite_absmax:
+                finite_absmax = chunk_absmax
+
         raise RuntimeError(
             f"P-EAGLE produced non-finite values at {name}: "
-            f"finite={int(finite.sum().item())}/{tensor.numel()} "
+            f"finite={finite_count}/{tensor.numel()} "
             f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
             f"finite_absmax={finite_absmax}"
         )

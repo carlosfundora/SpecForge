@@ -111,6 +111,17 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
                     if 0 <= mask_token_id < model.embed_tokens.weight.shape[0]:
                         model.embed_tokens.weight[mask_token_id].zero_()
 
+        if hasattr(model, "mask_token_embedding") and not torch.isfinite(
+            model.mask_token_embedding
+        ).all():
+            warnings.warn(
+                "Resetting mask_token_embedding to zeros because the loaded draft "
+                "checkpoint does not provide a valid dedicated mask embedding.",
+                stacklevel=2,
+            )
+            with torch.no_grad():
+                model.mask_token_embedding.zero_()
+
         return model
 
 
